@@ -1,3 +1,4 @@
+#include <unistd.h>
 #include "portal_backend.hpp"
 
 #include "security_policy.hpp"
@@ -15,6 +16,7 @@
 #include <QDBusUnixFileDescriptor>
 #include <QDBusVariant>
 #include <QDebug>
+#include <QFile>
 #include <QFileInfo>
 #include <QTimer>
 
@@ -112,6 +114,26 @@ QString executablePathForBusService(const QDBusConnection& connection, const QSt
         return {};
 
     return QFileInfo(QStringLiteral("/proc/%1/exe").arg(pid.value())).symLinkTarget();
+}
+
+bool isSynergyServiceCaller(const QDBusConnection& connection, const QString& serviceName) {
+    auto* bus = connection.interface();
+    if (!bus)
+        return false;
+    const QDBusReply<uint> pid = bus->servicePid(serviceName);
+    if (!pid.isValid() || pid.value() == 0)
+        return false;
+
+    const QString proc = QStringLiteral("/proc/%1/").arg(pid.value());
+    QFile cgroup(proc + QStringLiteral("cgroup"));
+    QFile comm(proc + QStringLiteral("comm"));
+    if (!cgroup.open(QIODevice::ReadOnly) || !comm.open(QIODevice::ReadOnly))
+        return false;
+
+    const auto uid = QByteArray::number(getuid());
+    const auto expected = "0::/user.slice/user-" + uid + ".slice/user@" + uid +
+                          ".service/app.slice/synergy-3.service";
+    return cgroup.readAll().trimmed() == expected && comm.readAll().trimmed() == "synergy-core";
 }
 
 bool serviceOwnsKdeConnectName(const QDBusConnection& connection, const QString& serviceName) {
@@ -397,6 +419,7 @@ bool PortalBackend::handleRemoteDesktop(const QDBusMessage& message, const QDBus
             session->appId = security::normalizedAppId(*appId);
         if (!isAllowedApp(session->appId, sessionHandle->path(), connection)) {
             qWarning() << "refusing RemoteDesktop session for app id" << safeForLog(session->appId);
+            m_sessions.erase(session);
             sendPortalRequestResponse(connection, response(message, 1, {{QStringLiteral("error"), QStringLiteral("app id is not allowed")}}));
             return true;
         }
@@ -716,11 +739,12 @@ bool PortalBackend::isAllowedApp(const QString& appId, const QString& sessionPat
     if (!senderBusName)
         return false;
 
-    if (!serviceOwnsKdeConnectName(connection, *senderBusName))
-        return false;
+    if (isSynergyServiceCaller(connection, *senderBusName))
+        return true;
 
     const QString executablePath = executablePathForBusService(connection, *senderBusName);
-    if (!security::isAllowedFallbackExecutablePath(executablePath))
+    if (!serviceOwnsKdeConnectName(connection, *senderBusName) ||
+        !security::isAllowedFallbackExecutablePath(executablePath))
         return false;
 
     qInfo() << "allowing RemoteDesktop session with fallback app id" << safeForLog(appId) << "from" << executablePath << *senderBusName;
